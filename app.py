@@ -10,7 +10,7 @@ from flask import Flask, request, redirect, url_for, session, render_template_st
 from urllib.parse import urlparse
 import re
 from dotenv import load_dotenv
-from werkzeug.security import check_password_hash
+from werkzeug.security import check_password_hash, generate_password_hash
 
 from detector import analyze_url
 from database import get_connection
@@ -98,7 +98,8 @@ def ensure_user_schema():
         CREATE TABLE IF NOT EXISTS users (
             id INT AUTO_INCREMENT PRIMARY KEY,
             name VARCHAR(100) NOT NULL,
-            email VARCHAR(255) NOT NULL UNIQUE,
+            email VARCHAR(255) NULL UNIQUE,
+            password_hash VARCHAR(255) NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
@@ -118,6 +119,25 @@ def ensure_user_schema():
             cursor.execute(
                 f"ALTER TABLE `{table_name}` ADD COLUMN `{column_name}` {column_definition}"
             )
+
+    add_column_if_missing("users", "password_hash", "VARCHAR(255) NULL")
+    # Email is retained for existing records/admin reporting, but user login no longer requires it.
+    cursor.execute("""
+        ALTER TABLE users MODIFY COLUMN email VARCHAR(255) NULL
+    """)
+
+    # Existing PhishGuard databases may have the legacy users.email column marked NOT NULL.
+    # New name+password accounts do not require an email, so make that column nullable.
+    cursor.execute("""
+        SELECT IS_NULLABLE
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = 'users'
+          AND COLUMN_NAME = 'email'
+    """)
+    email_nullable = cursor.fetchone()
+    if email_nullable and email_nullable[0] != 'YES':
+        cursor.execute("ALTER TABLE users MODIFY COLUMN email VARCHAR(255) NULL")
 
     add_column_if_missing("analysis_history", "user_id", "INT NULL")
     add_column_if_missing("reports", "user_id", "INT NULL")
@@ -149,24 +169,61 @@ def ensure_user_schema():
     connection.close()
 
 
-def get_or_create_user(name, email):
+def authenticate_user(name, password):
+    """Authenticate an existing user using name + password only."""
     connection = get_connection()
     cursor = connection.cursor()
 
     cursor.execute("""
-        INSERT INTO users (name, email)
-        VALUES (%s, %s)
-        ON DUPLICATE KEY UPDATE name = VALUES(name)
-    """, (name, email))
+        SELECT id, name, email, password_hash
+        FROM users
+        WHERE name = %s
+        ORDER BY id ASC
+    """, (name,))
 
+    matches = cursor.fetchall()
+
+    for user in matches:
+        if user[3] and check_password_hash(user[3], password):
+            cursor.close()
+            connection.close()
+            return user
+
+    cursor.close()
+    connection.close()
+    return None
+
+
+def create_user(name, password):
+    """Create a new PhishGuard user account."""
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute("SELECT id FROM users WHERE name = %s LIMIT 1", (name,))
+    existing = cursor.fetchone()
+
+    if existing:
+        cursor.close()
+        connection.close()
+        return None
+
+    password_hash = generate_password_hash(password)
+    cursor.execute("""
+        INSERT INTO users (name, email, password_hash)
+        VALUES (%s, NULL, %s)
+    """, (name, password_hash))
     connection.commit()
 
-    cursor.execute("SELECT id, name, email FROM users WHERE email = %s", (email,))
+    user_id = cursor.lastrowid
+    cursor.execute("""
+        SELECT id, name, email, password_hash
+        FROM users
+        WHERE id = %s
+    """, (user_id,))
     user = cursor.fetchone()
 
     cursor.close()
     connection.close()
-
     return user
 
 
@@ -541,30 +598,30 @@ def user_login():
     if request.method == "POST":
 
         name = request.form.get("name", "").strip()
-        email = request.form.get("email", "").strip().lower()
+        password = request.form.get("password", "")
 
         if not name:
-            error = "Please enter your name."
+            error = "Please enter your user name."
 
         elif len(name) > 100:
-            error = "Name must be 100 characters or fewer."
+            error = "User name must be 100 characters or fewer."
 
-        elif not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
-            error = "Please enter a valid email address."
+        elif len(password) < 6:
+            error = "Password must be at least 6 characters."
 
         if error is None:
-            user = get_or_create_user(name, email)
+            user = authenticate_user(name, password)
 
             if user:
                 session.clear()
                 session["user_logged_in"] = True
                 session["user_id"] = user[0]
                 session["user_name"] = user[1]
-                session["user_email"] = user[2]
+                session["user_email"] = user[2] or ""
 
                 return redirect(url_for("user_dashboard"))
 
-            error = "Unable to create user access. Please try again."
+            error = "Invalid user name or incorrect password. Please try again."
 
     return render_template_string("""
 <!DOCTYPE html>
@@ -580,22 +637,96 @@ h1 { text-align:center; margin-bottom:10px; }
 .subtitle { text-align:center; color:#94a3b8; margin-bottom:28px; line-height:1.5; }
 input { width:100%; padding:14px; margin-bottom:15px; border-radius:8px; border:1px solid #334155; background:#020617; color:white; box-sizing:border-box; font-size:15px; }
 button { width:100%; padding:14px; border:none; border-radius:8px; background:#0284c7; color:white; font-weight:bold; cursor:pointer; font-size:15px; }
-.error { background:rgba(239,68,68,0.1); color:#f87171; padding:10px; border-radius:8px; margin-bottom:15px; text-align:center; }
+.error { background:rgba(239,68,68,0.12); color:#f87171; padding:12px; border-radius:8px; margin-bottom:15px; text-align:center; line-height:1.4; }
 .note { margin-top:18px; text-align:center; color:#64748b; font-size:12px; line-height:1.5; }
+.register { display:block; margin-top:16px; text-align:center; color:#38bdf8; text-decoration:none; font-size:14px; }
 </style>
 </head>
 <body>
 <div class="login-box">
     <h1>🛡️ PhishGuard</h1>
-    <div class="subtitle">Enter your name and email to access your personal PhishGuard workspace.</div>
+    <div class="subtitle">Enter your user name and password to access your personal PhishGuard workspace.</div>
     {% if error %}<div class="error">{{ error }}</div>{% endif %}
     <form method="POST">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-        <input type="text" name="name" placeholder="Enter your name" maxlength="100" required>
-        <input type="email" name="email" placeholder="Enter your email address" maxlength="255" required>
-        <button type="submit">Continue to PhishGuard</button>
+        <input type="text" name="name" placeholder="Enter your user name" maxlength="100" required>
+        <input type="password" name="password" placeholder="Enter your password" minlength="6" required>
+        <button type="submit">Login to PhishGuard</button>
     </form>
-    <div class="note">Your analysis history and reports are linked to the email address you enter.</div>
+    <a class="register" href="/register">➕ New user? Create an account</a>
+    <div class="note">Your analysis history and reports are linked to your PhishGuard account.</div>
+</div>
+</body>
+</html>
+""")
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+
+    error = None
+    success = None
+
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        password = request.form.get("password", "")
+        confirm_password = request.form.get("confirm_password", "")
+
+        if not name:
+            error = "Please enter a user name."
+        elif len(name) > 100:
+            error = "User name must be 100 characters or fewer."
+        elif len(password) < 6:
+            error = "Password must be at least 6 characters."
+        elif password != confirm_password:
+            error = "Passwords do not match."
+        elif not re.fullmatch(r"[A-Za-z0-9 ._-]+", name):
+            error = "User name can contain letters, numbers, spaces, dot, underscore and hyphen only."
+
+        if error is None:
+            user = create_user(name, password)
+            if user:
+                session.clear()
+                session["user_logged_in"] = True
+                session["user_id"] = user[0]
+                session["user_name"] = user[1]
+                session["user_email"] = ""
+                return redirect(url_for("user_dashboard"))
+            error = "That user name already exists. Please choose another one."
+
+    return render_template_string("""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Create Account - PhishGuard</title>
+<style>
+body { margin:0; min-height:100vh; display:flex; justify-content:center; align-items:center; background:#020617; color:white; font-family:Arial,sans-serif; }
+.login-box { width:390px; background:#0f172a; padding:35px; border-radius:18px; border:1px solid #1e293b; box-shadow:0 20px 50px rgba(0,0,0,0.4); }
+h1 { text-align:center; margin-bottom:10px; }
+.subtitle { text-align:center; color:#94a3b8; margin-bottom:28px; line-height:1.5; }
+input { width:100%; padding:14px; margin-bottom:15px; border-radius:8px; border:1px solid #334155; background:#020617; color:white; box-sizing:border-box; font-size:15px; }
+button { width:100%; padding:14px; border:none; border-radius:8px; background:#0284c7; color:white; font-weight:bold; cursor:pointer; font-size:15px; }
+.error { background:rgba(239,68,68,0.12); color:#f87171; padding:12px; border-radius:8px; margin-bottom:15px; text-align:center; line-height:1.4; }
+.back { display:block; margin-top:16px; text-align:center; color:#38bdf8; text-decoration:none; font-size:14px; }
+.note { margin-top:18px; text-align:center; color:#64748b; font-size:12px; line-height:1.5; }
+</style>
+</head>
+<body>
+<div class="login-box">
+    <h1>🛡️ Create PhishGuard Account</h1>
+    <div class="subtitle">Create a user name and password for your personal workspace.</div>
+    {% if error %}<div class="error">{{ error }}</div>{% endif %}
+    <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <input type="text" name="name" placeholder="Choose a user name" maxlength="100" required>
+        <input type="password" name="password" placeholder="Create a password" minlength="6" required>
+        <input type="password" name="confirm_password" placeholder="Confirm password" minlength="6" required>
+        <button type="submit">Create Account</button>
+    </form>
+    <a class="back" href="{{ url_for('user_login') }}">← Back to Login</a>
+    <div class="note">Use a unique user name and remember your password.</div>
 </div>
 </body>
 </html>
@@ -4622,5 +4753,5 @@ def delete_report(report_id):
 # ============================================================
 
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+
+    app.run(debug=True)
